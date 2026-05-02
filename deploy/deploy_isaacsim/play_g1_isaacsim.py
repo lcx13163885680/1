@@ -58,6 +58,21 @@ parser.add_argument("--stabilize_seconds", type=float, default=1.0,
                     help="seconds of PD-controlled standing before policy takes over")
 parser.add_argument("--rebuild_usd", action="store_true",
                     help="force re-conversion of URDF -> USD (use after changing drive cfg)")
+parser.add_argument("--ground_friction", type=float, default=1.0,
+                    help="ground static/dynamic friction coefficient")
+parser.add_argument("--joint_armature", type=float, default=0.01,
+                    help="MJCF default armature; rotor inertia added to each joint axis")
+parser.add_argument("--joint_friction", type=float, default=0.1,
+                    help="MJCF default frictionloss; Coulomb dry friction torque per joint")
+parser.add_argument("--thick_feet", action="store_true",
+                    help="enlarge the URDF's 4 corner foot spheres from 5 mm (matches MJCF) "
+                         "to 12 mm so PhysX's default 2 cm contact_offset doesn't make them "
+                         "buzz against the ground. Forces a USD rebuild.")
+parser.add_argument("--foot_radius", type=float, default=0.012,
+                    help="radius (m) of foot corner spheres when --thick_feet is used")
+parser.add_argument("--print_obs_every", type=int, default=0,
+                    help="if >0, dump the full 47-d observation every N policy steps "
+                         "(useful for cross-checking against deploy_mujoco.py)")
 
 # Make sure Isaac Lab source is importable (kept compatible with the user's env).
 _isaaclab_src_candidates = [
@@ -104,19 +119,78 @@ usd_path = os.path.join(usd_dir, "g1_12dof.usd")
 
 
 # ---------------------------------------------------------------------------
+# Optional URDF rewrite: enlarge the 4 corner foot spheres.
+#
+# The MJCF and URDF both use 4 spheres of radius 0.005 m as the foot contact.
+# In MuJoCo this works perfectly (point contact). In PhysX, the default
+# contact_offset is 0.02 m, so a 5 mm sphere produces a tall, narrow "shell"
+# of detection-but-no-penetration that is numerically twitchy and tends to
+# flicker during the swing-to-stance transition - the textbook reason a
+# walking policy starts strong and then nose-dives forward.
+# ---------------------------------------------------------------------------
+def make_thick_feet_urdf(src_urdf_path: str, sphere_radius: float) -> str:
+    """Return path to a URDF where ankle_roll spheres are enlarged to `sphere_radius` m."""
+    import re
+    with open(src_urdf_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    foot_corners = [
+        (-0.05,  0.025, -0.03),
+        (-0.05, -0.025, -0.03),
+        ( 0.12,  0.030, -0.03),
+        ( 0.12, -0.030, -0.03),
+    ]
+    sphere_blob = "".join(
+        f'    <collision>\n'
+        f'      <origin xyz="{x} {y} {z}" rpy="0 0 0"/>\n'
+        f'      <geometry><sphere radius="{sphere_radius}"/></geometry>\n'
+        f'    </collision>\n'
+        for (x, y, z) in foot_corners
+    )
+
+    def _patch(link_name: str, src: str) -> str:
+        # Replace ALL <collision>...</collision> entries inside the named link.
+        link_pat = re.compile(
+            rf'(<link name="{link_name}">)(.*?)(</link>)', re.DOTALL,
+        )
+
+        def _swap(m):
+            head, body, tail = m.group(1), m.group(2), m.group(3)
+            body = re.sub(r'<collision>.*?</collision>\s*', '', body, flags=re.DOTALL)
+            return head + body + sphere_blob + tail
+        return link_pat.sub(_swap, src)
+
+    text = _patch("left_ankle_roll_link", text)
+    text = _patch("right_ankle_roll_link", text)
+
+    out_path = os.path.join(os.path.dirname(src_urdf_path), "g1_12dof_thickfeet.urdf")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # URDF -> USD
 #
-# NOTE: stiffness = damping = 0 here so that the USD's joint drive does NOT
-# add any extra PD on top of our explicit Python PD. Pure torque control.
+# NOTE: stiffness = damping = 0 here so the USD's joint drive does NOT add
+# any extra PD on top of our explicit Python PD. Pure torque control only.
 # ---------------------------------------------------------------------------
-need_convert = args.rebuild_usd or not os.path.exists(usd_path)
+if args.thick_feet:
+    URDF_PATH = make_thick_feet_urdf(URDF_PATH, args.foot_radius)
+    usd_path = os.path.join(usd_dir, "g1_12dof_thickfeet.usd")
+    usd_file_name = "g1_12dof_thickfeet.usd"
+    print(f"[URDF] using thick-feet URDF (radius {args.foot_radius*1000:.1f} mm): {URDF_PATH}")
+else:
+    usd_file_name = "g1_12dof.usd"
+
+need_convert = args.rebuild_usd or args.thick_feet or not os.path.exists(usd_path)
 if need_convert:
     print(f"[URDF->USD] converting {URDF_PATH}")
     converter = UrdfConverter(
         UrdfConverterCfg(
             asset_path=URDF_PATH,
             usd_dir=usd_dir,
-            usd_file_name="g1_12dof.usd",
+            usd_file_name=usd_file_name,
             force_usd_conversion=True,
             fix_base=False,
             self_collision=False,
@@ -179,9 +253,11 @@ sim_ctx = SimulationContext(sim_cfg)
 ground_cfg = sim_utils.GroundPlaneCfg(
     size=(100.0, 100.0),
     physics_material=sim_utils.RigidBodyMaterialCfg(
-        static_friction=1.0,
-        dynamic_friction=1.0,
+        static_friction=float(args.ground_friction),
+        dynamic_friction=float(args.ground_friction),
         restitution=0.0,
+        friction_combine_mode="multiply",
+        restitution_combine_mode="multiply",
     ),
 )
 ground_cfg.func("/World/ground", ground_cfg)
@@ -211,6 +287,13 @@ robot_cfg = ArticulationCfg(
             max_depenetration_velocity=1.0,
             enable_gyroscopic_forces=True,
         ),
+        # Tighter contact tolerances stop the small foot spheres from "buzzing".
+        # MuJoCo effectively uses zero contact offset; we get close to that.
+        collision_props=sim_utils.CollisionPropertiesCfg(
+            collision_enabled=True,
+            contact_offset=0.005,
+            rest_offset=0.0,
+        ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=False,
             solver_position_iteration_count=8,
@@ -238,12 +321,20 @@ robot_cfg = ArticulationCfg(
         },
     ),
     actuators={
+        # No PhysX-side PD; we drive everything via set_joint_effort_target().
+        # armature/friction here mirror the MJCF <default joint> block:
+        #   <joint damping="0.001" armature="0.01" frictionloss="0.1"/>
+        # Without these PhysX joints have less rotor inertia and zero dry friction,
+        # which makes the same kp/kd far snappier than in MuJoCo and is the most
+        # common reason a working policy "looks normal" but tips forward.
         "legs": ImplicitActuatorCfg(
             joint_names_expr=[".*_joint"],
             stiffness=0.0,
             damping=0.0,
             effort_limit=200.0,
             velocity_limit=100.0,
+            armature=float(args.joint_armature),
+            friction=float(args.joint_friction),
         ),
     },
 )
@@ -466,6 +557,17 @@ try:
                     f"phase={phase:.2f} |tau|max={float(tau_now.abs().max()):5.1f} "
                     f"VRAM={vram*100:.0f}%"
                 )
+
+            if args.print_obs_every and policy_step_count % args.print_obs_every == 0:
+                obs_np = obs_buf[0].cpu().numpy()
+                np.set_printoptions(precision=3, suppress=True, linewidth=200)
+                print(f"  obs[ang_vel*0.25] = {obs_np[0:3]}")
+                print(f"  obs[gravity_b   ] = {obs_np[3:6]}")
+                print(f"  obs[cmd*scale   ] = {obs_np[6:9]}")
+                print(f"  obs[(q-q*)*1.0  ] = {obs_np[9:21]}   (training order)")
+                print(f"  obs[dq*0.05     ] = {obs_np[21:33]}  (training order)")
+                print(f"  obs[prev_action ] = {obs_np[33:45]}  (training order)")
+                print(f"  obs[sin,cos     ] = {obs_np[45:47]}")
 
         # ---- 200 Hz: explicit PD via effort target (the MuJoCo `d.ctrl[:] = tau` analogue) ----
         tau_isaac = explicit_pd(target_pos_isaac, robot.data.joint_pos, robot.data.joint_vel)
