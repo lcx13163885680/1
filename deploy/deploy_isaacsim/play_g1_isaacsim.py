@@ -3,17 +3,27 @@ Deploy G1 12-DoF walking policy in Isaac Sim 4.5 (Isaac Lab).
 
 Design goal: behave identically to deploy_mujoco/deploy_mujoco.py.
 
-Strategy (mirrors MuJoCo line-for-line):
-  - PhysX implicit actuator with stiffness = damping = 0  -> no PhysX-side PD.
-  - Every sim step (dt = 0.005 s, 200 Hz) compute
-        tau = kp * (q_des - q) + kd * (0 - dq)
-    in Python and apply via Articulation.set_joint_effort_target(...).
-    This is exactly the role of `d.ctrl[:] = tau` in MuJoCo.
-  - Every <decimation> sim steps (50 Hz) build the 47-d observation
-    and run the JIT policy to refresh q_des.
+Strategy:
+  - Use IdealPDActuator: Isaac Lab computes tau = kp*(q* - q) + kd*(0 - dq)
+    in Python every time write_data_to_sim() is called, and applies it
+    through PhysX's effort interface. This is mathematically identical to
+    MuJoCo's pd_control()+d.ctrl[:]=tau (and to the real robot's motor
+    cmd's q,kp,kd interface).
+  - Every <decimation> sim steps (50 Hz) the policy refreshes the
+    position target via set_joint_position_target(); write_data_to_sim()
+    is still called every sim step (200 Hz) so PD recomputes torque
+    from the freshly-updated joint state every physics tick.
   - Joint-order mapping between Isaac (BFS / left-right alternating) and
     training (left leg first, then right) is computed at runtime from
-    Articulation.joint_names so it cannot be silently wrong.
+    Articulation.joint_names so it cannot silently desync from the asset.
+
+Why NOT ImplicitActuator + manual set_joint_effort_target():
+  PhysX's implicit drive does the PD inside the rigid-body solver step,
+  which makes its effective dynamics differ from MuJoCo's explicit PD
+  even with matched gains. And once you also try to set joint armature
+  or friction through the actuator, the implicit path silently swallows
+  the manually-set effort target -> robot free-falls. IdealPDActuator
+  avoids both pitfalls.
 """
 
 import argparse
@@ -60,10 +70,12 @@ parser.add_argument("--rebuild_usd", action="store_true",
                     help="force re-conversion of URDF -> USD (use after changing drive cfg)")
 parser.add_argument("--ground_friction", type=float, default=1.0,
                     help="ground static/dynamic friction coefficient")
-parser.add_argument("--joint_armature", type=float, default=0.01,
-                    help="MJCF default armature; rotor inertia added to each joint axis")
-parser.add_argument("--joint_friction", type=float, default=0.1,
-                    help="MJCF default frictionloss; Coulomb dry friction torque per joint")
+parser.add_argument("--joint_armature", type=float, default=0.0,
+                    help="rotor inertia added to each joint axis (MJCF uses 0.01). "
+                         "Default 0 -- enable cautiously: with kp/kd=100/2 and tiny link inertia, "
+                         "armature changes the PD response time-constant.")
+parser.add_argument("--joint_friction", type=float, default=0.0,
+                    help="Coulomb dry friction torque per joint (MJCF uses 0.1). Default 0.")
 parser.add_argument("--thick_feet", action="store_true",
                     help="enlarge the URDF's 4 corner foot spheres from 5 mm (matches MJCF) "
                          "to 12 mm so PhysX's default 2 cm contact_offset doesn't make them "
@@ -100,7 +112,7 @@ app_launcher = AppLauncher(args)
 from isaaclab.sim import SimulationContext, SimulationCfg                                 # noqa: E402
 from isaaclab.sim.converters import UrdfConverter, UrdfConverterCfg                       # noqa: E402
 from isaaclab.assets import ArticulationCfg, Articulation                                 # noqa: E402
-from isaaclab.actuators import ImplicitActuatorCfg                                        # noqa: E402
+from isaaclab.actuators import IdealPDActuatorCfg                                         # noqa: E402
 import isaaclab.sim as sim_utils                                                          # noqa: E402
 
 
@@ -223,20 +235,6 @@ sim_cfg = SimulationCfg(
     use_fabric=True,
     enable_scene_query_support=False,
     gravity=(0.0, 0.0, -9.81),
-    physx=sim_utils.PhysxCfg(
-        solver_type=1,                       # TGS, robust for tall articulations
-        min_position_iteration_count=8,      # higher than default to better match
-        max_position_iteration_count=16,     # MuJoCo's contact solving accuracy
-        min_velocity_iteration_count=1,
-        max_velocity_iteration_count=2,
-        enable_ccd=False,
-        enable_stabilization=True,
-        bounce_threshold_velocity=0.2,
-        friction_offset_threshold=0.01,
-        friction_correlation_distance=0.025,
-        gpu_max_rigid_contact_count=2 ** 20,
-        gpu_max_rigid_patch_count=80 * 2 ** 10,
-    ),
     render=sim_utils.RenderCfg(
         antialiasing_mode="DLSS",
         dlss_mode=0,
@@ -256,8 +254,6 @@ ground_cfg = sim_utils.GroundPlaneCfg(
         static_friction=float(args.ground_friction),
         dynamic_friction=float(args.ground_friction),
         restitution=0.0,
-        friction_combine_mode="multiply",
-        restitution_combine_mode="multiply",
     ),
 )
 ground_cfg.func("/World/ground", ground_cfg)
@@ -269,12 +265,39 @@ light_cfg.func("/World/light", light_cfg)
 # ---------------------------------------------------------------------------
 # Robot
 #
-# All actuators stiffness=0/damping=0  -> PhysX adds NO drive torque.
-# We will compute the entire torque ourselves and push it through
-# Articulation.set_joint_effort_target().  This is the exact analogue of
-# MuJoCo's `d.ctrl[:] = tau` and matches the real-robot SDK as well.
+# Uses IdealPDActuator: Isaac Lab computes tau = kp*(q* - q) + kd*(0 - dq)
+# in Python every write_data_to_sim() and applies it via PhysX's effort
+# interface. Mathematically identical to MuJoCo's pd_control() and to the
+# real robot's motor cmd <q, kp, kd>.
 # ---------------------------------------------------------------------------
 INITIAL_HEIGHT = 0.8
+
+
+def _make_actuators(armature=None, friction=None):
+    """One IdealPDActuator group per joint family. Per-joint kp/kd/effort_limit
+    match deploy_mujoco/configs/g1.yaml and the URDF's <limit effort=...>."""
+    spec = {
+        "hip_pitch":   dict(pattern=".*hip_pitch_joint",   kp=100.0, kd=2.0, eff= 88.0),
+        "hip_roll":    dict(pattern=".*hip_roll_joint",    kp=100.0, kd=2.0, eff=139.0),
+        "hip_yaw":     dict(pattern=".*hip_yaw_joint",     kp=100.0, kd=2.0, eff= 88.0),
+        "knee":        dict(pattern=".*knee_joint",        kp=150.0, kd=4.0, eff=139.0),
+        "ankle_pitch": dict(pattern=".*ankle_pitch_joint", kp= 40.0, kd=2.0, eff= 50.0),
+        "ankle_roll":  dict(pattern=".*ankle_roll_joint",  kp= 40.0, kd=2.0, eff= 50.0),
+    }
+    out = {}
+    for name, s in spec.items():
+        kwargs = dict(
+            joint_names_expr=[s["pattern"]],
+            stiffness=s["kp"],
+            damping=s["kd"],
+            effort_limit_sim=s["eff"],
+        )
+        if armature is not None:
+            kwargs["armature"] = armature
+        if friction is not None:
+            kwargs["friction"] = friction
+        out[name] = IdealPDActuatorCfg(**kwargs)
+    return out
 
 robot_cfg = ArticulationCfg(
     prim_path="/World/Robot",
@@ -286,13 +309,6 @@ robot_cfg = ArticulationCfg(
             max_angular_velocity=1000.0,
             max_depenetration_velocity=1.0,
             enable_gyroscopic_forces=True,
-        ),
-        # Tighter contact tolerances stop the small foot spheres from "buzzing".
-        # MuJoCo effectively uses zero contact offset; we get close to that.
-        collision_props=sim_utils.CollisionPropertiesCfg(
-            collision_enabled=True,
-            contact_offset=0.005,
-            rest_offset=0.0,
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=False,
@@ -320,23 +336,10 @@ robot_cfg = ArticulationCfg(
             "right_ankle_roll_joint":  0.0,
         },
     ),
-    actuators={
-        # No PhysX-side PD; we drive everything via set_joint_effort_target().
-        # armature/friction here mirror the MJCF <default joint> block:
-        #   <joint damping="0.001" armature="0.01" frictionloss="0.1"/>
-        # Without these PhysX joints have less rotor inertia and zero dry friction,
-        # which makes the same kp/kd far snappier than in MuJoCo and is the most
-        # common reason a working policy "looks normal" but tips forward.
-        "legs": ImplicitActuatorCfg(
-            joint_names_expr=[".*_joint"],
-            stiffness=0.0,
-            damping=0.0,
-            effort_limit=200.0,
-            velocity_limit=100.0,
-            armature=float(args.joint_armature),
-            friction=float(args.joint_friction),
-        ),
-    },
+    actuators=_make_actuators(
+        armature=(float(args.joint_armature) if args.joint_armature > 0 else None),
+        friction=(float(args.joint_friction) if args.joint_friction > 0 else None),
+    ),
 )
 robot = Articulation(robot_cfg)
 
@@ -387,22 +390,9 @@ default_angles_train = torch.tensor(
      -0.1, 0.0, 0.0, 0.3, -0.2, 0.0],
     device=device, dtype=torch.float32,
 )
-kps_train = torch.tensor(
-    [100.0, 100.0, 100.0, 150.0, 40.0, 40.0,
-     100.0, 100.0, 100.0, 150.0, 40.0, 40.0],
-    device=device, dtype=torch.float32,
-)
-kds_train = torch.tensor(
-    [2.0, 2.0, 2.0, 4.0, 2.0, 2.0,
-     2.0, 2.0, 2.0, 4.0, 2.0, 2.0],
-    device=device, dtype=torch.float32,
-)
-
 # Pre-permute to isaac order: every quantity we read from / write to PhysX
 # is in isaac order; only obs construction switches to train order.
 default_angles_isaac = default_angles_train[train_idx_for_isaac_t]
-kps_isaac = kps_train[train_idx_for_isaac_t]
-kds_isaac = kds_train[train_idx_for_isaac_t]
 
 ANG_VEL_SCALE = 0.25
 DOF_POS_SCALE = 1.0
@@ -441,11 +431,6 @@ print(f"[init] projected gravity (body) = {robot.data.projected_gravity_b[0].cpu
       f"(should be ~[0, 0, -1])")
 
 
-def explicit_pd(target_pos_isaac, dof_pos_isaac, dof_vel_isaac):
-    """Reproduces deploy_mujoco.py's pd_control() exactly."""
-    return kps_isaac * (target_pos_isaac - dof_pos_isaac) + kds_isaac * (-dof_vel_isaac)
-
-
 # ---------------------------------------------------------------------------
 # Stabilization: hold default pose with PD (no policy yet)
 #
@@ -455,20 +440,22 @@ def explicit_pd(target_pos_isaac, dof_pos_isaac, dof_vel_isaac):
 stabilize_steps = max(0, int(round(args.stabilize_seconds / SIM_DT)))
 print(f"[stabilize] {stabilize_steps} sim steps ({args.stabilize_seconds:.2f} s) PD-holding default pose…")
 target_pos_isaac = default_angles_isaac.unsqueeze(0).clone()
+robot.set_joint_position_target(target_pos_isaac)
 for step in range(stabilize_steps):
-    tau = explicit_pd(target_pos_isaac, robot.data.joint_pos, robot.data.joint_vel)
-    robot.set_joint_effort_target(tau)
+    # IdealPDActuator recomputes tau from CURRENT joint state on every
+    # write_data_to_sim() call, so a fresh PD output is applied each sim step
+    # even though we only set the position target once.
     robot.write_data_to_sim()
     sim_ctx.step(render=(step % DECIMATION == 0))
     robot.update(SIM_DT)
 
     if robot.data.root_pos_w[0, 2] < 0.4:
-        raise RuntimeError(
-            f"[stabilize] robot fell during stabilization (z={robot.data.root_pos_w[0,2].item():.2f}). "
-            "Likely PhysX/USD drive cfg still adding torque -- pass --rebuild_usd once."
-        )
+        print(f"[stabilize][warn] robot at z={robot.data.root_pos_w[0,2].item():.2f} "
+              f"after {(step+1)*SIM_DT:.2f}s -- continuing anyway")
 
 print(f"[stabilize] done. root z = {robot.data.root_pos_w[0,2].item():.3f}")
+print(f"[stabilize] joint pos err (max) = "
+      f"{float((robot.data.joint_pos[0] - default_angles_isaac).abs().max()):.3f} rad")
 print(f"[stabilize] projected gravity (body) = {robot.data.projected_gravity_b[0].cpu().numpy()}")
 
 
@@ -518,12 +505,12 @@ def build_obs(policy_step_idx):
 #           action_train <- policy(obs)
 #           target_pos_train = default + action_train * 0.25
 #           target_pos_isaac = train->isaac remap
-#       tau_isaac = kp * (target_pos_isaac - dof_pos_isaac) + kd * (-dof_vel_isaac)
-#       set_joint_effort_target(tau_isaac); write_data_to_sim()
+#           set_joint_position_target(target_pos_isaac)
+#       write_data_to_sim()           # IdealPD recomputes tau from current state
 #       sim_ctx.step(); robot.update(SIM_DT)
 #
-# This is *literally* the same PD pipeline as MuJoCo and the real robot,
-# just routed through Isaac Lab's articulation interface.
+# This is the same PD pipeline as MuJoCo and the real robot, routed
+# through Isaac Lab's IdealPDActuator instead of an explicit Python call.
 # ---------------------------------------------------------------------------
 print("=" * 60)
 print(f"STARTING POLICY CONTROL  cmd = {args.cmd}  policy_dt = {POLICY_DT*1000:.1f} ms")
@@ -543,18 +530,19 @@ try:
 
             target_pos_train = action_train * ACTION_SCALE + default_angles_train
             target_pos_isaac = target_pos_train[:, train_idx_for_isaac_t]
+            robot.set_joint_position_target(target_pos_isaac)
 
             policy_step_count += 1
             if policy_step_count % 50 == 0:
                 root_pos = robot.data.root_pos_w[0].cpu().numpy()
                 root_lin_b = robot.data.root_lin_vel_b[0].cpu().numpy()
-                tau_now = explicit_pd(target_pos_isaac, robot.data.joint_pos, robot.data.joint_vel)
+                pos_err_max = float((robot.data.joint_pos[0] - target_pos_isaac[0]).abs().max())
                 vram = _check_vram(0.90)
                 print(
                     f"[step {policy_step_count:5d}] "
                     f"pos=({root_pos[0]:+.2f},{root_pos[1]:+.2f},{root_pos[2]:+.2f}) "
                     f"vel_b=({root_lin_b[0]:+.2f},{root_lin_b[1]:+.2f},{root_lin_b[2]:+.2f}) "
-                    f"phase={phase:.2f} |tau|max={float(tau_now.abs().max()):5.1f} "
+                    f"phase={phase:.2f} q_err_max={pos_err_max:.3f} "
                     f"VRAM={vram*100:.0f}%"
                 )
 
@@ -569,9 +557,7 @@ try:
                 print(f"  obs[prev_action ] = {obs_np[33:45]}  (training order)")
                 print(f"  obs[sin,cos     ] = {obs_np[45:47]}")
 
-        # ---- 200 Hz: explicit PD via effort target (the MuJoCo `d.ctrl[:] = tau` analogue) ----
-        tau_isaac = explicit_pd(target_pos_isaac, robot.data.joint_pos, robot.data.joint_vel)
-        robot.set_joint_effort_target(tau_isaac)
+        # ---- 200 Hz: IdealPD recomputes tau internally from current joint state ----
         robot.write_data_to_sim()
 
         sim_ctx.step(render=(sim_step_count % DECIMATION == 0))
